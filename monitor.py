@@ -16,7 +16,8 @@ from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 
-BASE_URL = 'https://www.nhsjobs.com/jobs_emp?emp=54'
+BASE_URL = 'https://www.healthjobsuk.com/jobs_emp?emp=54'
+FALLBACK_URL = 'https://www.nhsjobs.com/jobs_emp?emp=54'
 STATE_FILE = Path(os.getenv('STATE_FILE', 'seen_jobs.json'))
 EMPLOYER = 'Great Ormond Street Hospital for Children NHS Foundation Trust'
 # Matches the title ONLY. Broader research assistants and qualified psychologists are excluded.
@@ -54,7 +55,7 @@ def parse_jobs(html, base_url=BASE_URL):
         href = anchor.get('href', '')
         full_url = urljoin(base_url, href)
         parsed = urlparse(full_url)
-        if parsed.hostname not in ('www.nhsjobs.com', 'nhsjobs.com'):
+        if parsed.hostname not in ('www.nhsjobs.com', 'nhsjobs.com', 'www.healthjobsuk.com', 'healthjobsuk.com'):
             continue
         # Trac links contain a stable vacancy ID, e.g. ...-v8110690
         match = re.search(r'-v(\d+)(?:/)?$', parsed.path, re.I)
@@ -74,13 +75,34 @@ def parse_jobs(html, base_url=BASE_URL):
 
 
 def fetch_jobs():
+    """Try both public Trac listing domains; never treat blocking as zero vacancies."""
+    errors = []
     with requests.Session() as session:
-        session.headers.update({'User-Agent': 'GOSH-Assistant-Psychology-Watcher/1.0 (personal vacancy notifier)'})
-        resp = session.get(BASE_URL, timeout=30)
-        resp.raise_for_status()
-        if resp.url.split('?')[0].rstrip('/') != BASE_URL.split('?')[0].rstrip('/'):
-            raise ValueError('Employer listing redirected unexpectedly')
-        return parse_jobs(resp.text)
+        session.headers.update({
+            'User-Agent': 'GOSH-Assistant-Psychology-Watcher/1.1 (personal vacancy notifier)',
+            'Accept': 'text/html,application/xhtml+xml',
+        })
+        for url in (BASE_URL, FALLBACK_URL):
+            try:
+                resp = session.get(url, timeout=30)
+                resp.raise_for_status()
+                if urlparse(resp.url).hostname not in (
+                    'www.healthjobsuk.com', 'healthjobsuk.com',
+                    'www.nhsjobs.com', 'nhsjobs.com',
+                ):
+                    raise ValueError('Listing redirected outside expected recruitment sites')
+                jobs = parse_jobs(resp.text, base_url=resp.url)
+                LOG.info('Successfully checked %s', resp.url)
+                return jobs
+            except (requests.RequestException, ValueError) as exc:
+                errors.append(f'{url}: {type(exc).__name__}: {exc}')
+                LOG.warning('Listing source unavailable: %s', errors[-1])
+    raise RuntimeError(
+        'Both public Trac sources failed. The recruitment service may block '
+        'automated GitHub Actions requests (HTTP 403). This is not an email '
+        'configuration issue. No vacancies have been checked and state was not '
+        'updated.\n' + '\n'.join(errors)
+    )
 
 
 def load_state():
@@ -134,7 +156,7 @@ def main(argv=None):
         return 0
 
     current = fetch_jobs()  # Important: do not save state on HTTP/parse failure
-    print(f'Scanned Trac employer listing: {len(current)} matching jobs')
+    print(f'Scanned GOSH Trac employer listing: {len(current)} matching jobs')
     for job in current.values():
         print(f"  {job['title']} ({job['id']}): {job['url']}")
     if args.dry_run:
