@@ -1,9 +1,18 @@
-# GOSH job monitor v2: official NHS Jobs XML feed
+# GOSH job monitor v2.1: official NHS Jobs XML feed
 
-This is an experimental feed integration for learning. It replaces the blocked
-Trac HTML scraper. It has not yet passed a live feed test: NHS Jobs returned
-HTTP 403 from the development environment. GitHub Actions access is still
-unknown. Offline tests verify behavior, not live access or feed coverage.
+GitHub Actions reached the XML endpoint with HTTP 200, but v2 rejected a
+vacancy URL because it imposed an undocumented hostname/path requirement.
+Version 2.1 accepts normal HTTP/HTTPS vacancy links, including third-party
+recruitment systems, and resolves root-relative links against NHS Jobs. It
+still rejects malformed links and non-web schemes. The actual rejected URL
+was not present in the user's log, so this fix needs another live test.
+
+Replace monitor.py to apply the fix. Replace tests/test_monitor.py as well to
+include the two new regression tests (11 tests total). Keep the existing
+requirements.txt, workflow, email secrets and seen_jobs.json.
+
+Start a new workflow run on main with mode test-feed. A successful run should
+log Successfully parsed NHS Jobs XML. This test does not send email or save state.
 
 ## Update your existing GOSHTracker repository
 
@@ -85,7 +94,7 @@ pattern are not dedicated fields in this XML response, so they are not inferred.
 
 1. Request the XML feed with requests.
 2. Parse it with defusedxml and validate the wrapper, counts, required fields,
-   and NHS Jobs vacancy links.
+   and web vacancy links. The program does not fetch those links.
 3. Fetch all pages. Reject repeated IDs, inconsistent totals or incomplete results.
 4. Filter by exact employer name, then title.
 5. Compare the NHS Jobs IDs with seen_jobs.json.
@@ -121,7 +130,7 @@ matching jobs when creating the initial v2 baseline; it does not resend seen IDs
 
 - Both HTML hosts returned 403 in the user's GitHub Actions logs. That establishes
   refusal for those requests, not the site's exact blocking policy.
-- The documented API may also be blocked; only the new GitHub run will tell us.
+- The API returned HTTP 200 in GitHub Actions, but a full parse still needs testing.
 - There is no failure email or daily heartbeat in this version. Errors appear in
   Actions logs. Configure GitHub's workflow-failure notifications separately.
 - Cron requests runs at minutes 7 and 37 of each hour; execution can be delayed.

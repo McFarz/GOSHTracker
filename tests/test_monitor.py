@@ -25,6 +25,31 @@ def response(xml, status=200):
 
 
 class MonitorTests(unittest.TestCase):
+    def test_vacancy_web_url_variants(self):
+        links = [
+            'https://beta.jobs.nhs.uk/candidate/jobadvert/C9271-26-0001',
+            'http://www.jobs.nhs.uk/candidate/jobadvert/C9271-26-0001',
+            'https://apps.trac.jobs/job-advert/12345',
+            'https://www.healthjobsuk.com/job/UK/London/Psychology-v12345',
+            'https://recruitment.example.org/vacancy/12345',
+            '/candidate/jobadvert/C9271-26-0001',
+            '//beta.jobs.nhs.uk/candidate/jobadvert/C9271-26-0001',
+        ]
+        for value in links:
+            with self.subTest(value=value):
+                row = job()
+                row['url'] = value
+                parsed = m.parse_page(feed([row]))[2][0]['url']
+                self.assertTrue(parsed.startswith(('https://', 'http://')))
+
+    def test_invalid_vacancy_links_rejected(self):
+        links = ('javascript:alert(1)', 'file:///tmp/a',
+                 'https://user:password@example.org/a', 'https://example.org:abc/a',
+                 'https://example.org/a b', 'https:///missing-host', 'https://example.org\\a')
+        for value in links:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                m.normalize_vacancy_url(value)
+
     def test_recognized_empty_feed(self):
         self.assertEqual(m.parse_page(feed(pages=0)), (0, 0, []))
 

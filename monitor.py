@@ -28,6 +28,25 @@ TITLE_PATTERN = re.compile(
 LOG = logging.getLogger('gosh-monitor')
 
 
+def normalize_vacancy_url(value):
+    """The documented url is a web link, not a fixed NHS Jobs path."""
+    if not value or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in value) or '\\' in value:
+        raise ValueError(f'Malformed vacancy URL in feed: {value!r}')
+    if not value.startswith(('/', 'http://', 'https://')):
+        raise ValueError(f'Unsupported vacancy URL format in feed: {value!r}')
+    normalized = urljoin(FEED_URL, value) if value.startswith('/') else value
+    try:
+        link = urlparse(normalized)
+        valid = (link.scheme in ('http', 'https') and link.hostname
+                 and '.' in link.hostname and not link.username and not link.password
+                 and link.port in (None, 80, 443))
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ValueError(f'Malformed vacancy URL in feed: {value!r}')
+    return normalized
+
+
 def parse_page(xml):
     """Validate the documented XML wrapper, counts and required vacancy fields."""
     root = ET.fromstring(xml)
@@ -46,9 +65,7 @@ def parse_page(xml):
         job = {n.tag: (n.text or '').strip() for n in element}
         if not all(job.get(k) for k in ('id', 'title', 'employer', 'url')):
             raise ValueError('Vacancy missing id, title, employer or url')
-        link = urlparse(job['url'])
-        if link.scheme != 'https' or link.hostname != 'www.jobs.nhs.uk' or not link.path.startswith('/candidate/jobadvert/'):
-            raise ValueError('Unexpected vacancy URL in feed')
+        job['url'] = normalize_vacancy_url(job['url'])
         # Namespace source IDs: old Trac numeric IDs belong to another system.
         job['id'] = 'nhsjobs:' + job['id']
         rows.append(job)
@@ -68,7 +85,7 @@ def fetch_jobs():
     all_jobs = {}
     expected = None
     with requests.Session() as session:
-        session.headers.update({'User-Agent': 'GOSH-Vacancy-Monitor/2.0', 'Accept': 'application/xml'})
+        session.headers.update({'User-Agent': 'GOSH-Vacancy-Monitor/2.1', 'Accept': 'application/xml'})
         for page in range(1, 101):
             params['page'] = page
             response = session.get(FEED_URL, params=params, timeout=30)
