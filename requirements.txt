@@ -1,2 +1,2 @@
-requests>=2.32,<3
-beautifulsoup4>=4.12,<5
+requests>=2.32.4,<3
+defusedxml>=0.7.1,<1

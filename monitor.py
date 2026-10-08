@@ -1,4 +1,4 @@
-"""GOSH assistant psychology vacancy watcher (public Trac employer listing)."""
+"""GOSH assistant psychology vacancy watcher using the official NHS Jobs XML API."""
 from __future__ import annotations
 
 import argparse
@@ -14,10 +14,9 @@ from email.message import EmailMessage
 from urllib.parse import urljoin, urlparse
 
 import requests
-from bs4 import BeautifulSoup
+from defusedxml import ElementTree as ET
 
-BASE_URL = 'https://www.healthjobsuk.com/jobs_emp?emp=54'
-FALLBACK_URL = 'https://www.nhsjobs.com/jobs_emp?emp=54'
+FEED_URL = 'https://www.jobs.nhs.uk/api/v1/search_xml'
 STATE_FILE = Path(os.getenv('STATE_FILE', 'seen_jobs.json'))
 EMPLOYER = 'Great Ormond Street Hospital for Children NHS Foundation Trust'
 # Matches the title ONLY. Broader research assistants and qualified psychologists are excluded.
@@ -26,83 +25,82 @@ TITLE_PATTERN = re.compile(
     r'(?:clinical\s+)?psychology\s+assistant|'
     r'psychological\s+assistant)\b', re.I
 )
-BAND_PATTERN = re.compile(
-    r'\s+(?:(?:NHS\s+)?AfC:\s*)?Band\s+\d+[a-z]?\b|'
-    r'\s+NHS\s+Medical\s*&\s*Dental:', re.I
-)
 LOG = logging.getLogger('gosh-monitor')
 
 
-def extract_title(anchor):
-    """Extract a title from employer-list links, avoiding band/employer/metadata."""
-    # First prefer heading or a dedicated title node if the site exposes one.
-    specific = anchor.select_one('h2, h3, h4, .job-title, .vacancy-title')
-    text = specific.get_text(' ', strip=True) if specific else anchor.get_text(' ', strip=True)
-    text = re.sub(r'\s+', ' ', text).strip()
-    # Typical Trac link text: 'Assistant Psychologist Band 4 Great Ormond...'
-    text = BAND_PATTERN.split(text, maxsplit=1)[0]
-    if EMPLOYER.casefold() in text.casefold():
-        text = re.split(re.escape(EMPLOYER), text, flags=re.I)[0].strip()
-    return text
-
-
-def parse_jobs(html, base_url=BASE_URL):
-    """Return unique title-matching vacancies; fail when listing structure is unrecognisable."""
-    soup = BeautifulSoup(html, 'html.parser')
-    result = {}
-    valid_links = 0
-    for anchor in soup.select('a[href]'):
-        href = anchor.get('href', '')
-        full_url = urljoin(base_url, href)
-        parsed = urlparse(full_url)
-        if parsed.hostname not in ('www.nhsjobs.com', 'nhsjobs.com', 'www.healthjobsuk.com', 'healthjobsuk.com'):
-            continue
-        # Trac links contain a stable vacancy ID, e.g. ...-v8110690
-        match = re.search(r'-v(\d+)(?:/)?$', parsed.path, re.I)
-        if not match:
-            continue
-        valid_links += 1
-        title = extract_title(anchor)
-        if TITLE_PATTERN.search(title) and not re.search(r'neuro\s*psycholog', title, re.I):
-            vid = match.group(1)
-            result[vid] = {'id': vid, 'title': title, 'url': full_url.split('?')[0]}
-    # An empty list with a legitimate listing page is okay, but do not silently
-    # accept a block/challenge or redesign as 'no jobs'.
-    page_text = soup.get_text(' ', strip=True).casefold()
-    if not valid_links and not ('vacancies' in page_text and 'find jobs' in page_text):
-        raise ValueError('No recognizable Trac vacancy links or employer vacancy listing detected')
-    return result
+def parse_page(xml):
+    """Validate the documented XML wrapper, counts and required vacancy fields."""
+    root = ET.fromstring(xml)
+    # Ignore namespace prefixes while keeping field names case sensitive.
+    for node in root.iter():
+        node.tag = node.tag.rsplit('}', 1)[-1]
+    if root.tag != 'nhsJobs':
+        raise ValueError('Expected nhsJobs XML, received a different response')
+    try:
+        pages = int(root.findtext('totalPages', ''))
+        total = int(root.findtext('totalResults', ''))
+    except ValueError as exc:
+        raise ValueError('Missing or invalid feed result counts') from exc
+    rows = []
+    for element in root.findall('vacancyDetails'):
+        job = {n.tag: (n.text or '').strip() for n in element}
+        if not all(job.get(k) for k in ('id', 'title', 'employer', 'url')):
+            raise ValueError('Vacancy missing id, title, employer or url')
+        link = urlparse(job['url'])
+        if link.scheme != 'https' or link.hostname != 'www.jobs.nhs.uk' or not link.path.startswith('/candidate/jobadvert/'):
+            raise ValueError('Unexpected vacancy URL in feed')
+        # Namespace source IDs: old Trac numeric IDs belong to another system.
+        job['id'] = 'nhsjobs:' + job['id']
+        rows.append(job)
+    if total < 0 or pages < 0 or (total == 0 and (rows or pages > 1)) or (total > 0 and (pages == 0 or not rows)):
+        raise ValueError('Feed counts and vacancy rows disagree')
+    return pages, total, rows
 
 
 def fetch_jobs():
-    """Try both public Trac listing domains; never treat blocking as zero vacancies."""
-    errors = []
+    """Retrieve every page before filtering; a partial fetch never advances state."""
+    code = os.getenv('NHS_EMPLOYER_CODE', '').strip()
+    params = {'limit': 100, 'page': 1, 'sort': 'publicationDateDesc'}
+    if code:
+        params.update(employerCode=code, externalOnly='true')
+    else:
+        params['employer'] = EMPLOYER
+    all_jobs = {}
+    expected = None
     with requests.Session() as session:
-        session.headers.update({
-            'User-Agent': 'GOSH-Assistant-Psychology-Watcher/1.1 (personal vacancy notifier)',
-            'Accept': 'text/html,application/xhtml+xml',
-        })
-        for url in (BASE_URL, FALLBACK_URL):
-            try:
-                resp = session.get(url, timeout=30)
-                resp.raise_for_status()
-                if urlparse(resp.url).hostname not in (
-                    'www.healthjobsuk.com', 'healthjobsuk.com',
-                    'www.nhsjobs.com', 'nhsjobs.com',
-                ):
-                    raise ValueError('Listing redirected outside expected recruitment sites')
-                jobs = parse_jobs(resp.text, base_url=resp.url)
-                LOG.info('Successfully checked %s', resp.url)
-                return jobs
-            except (requests.RequestException, ValueError) as exc:
-                errors.append(f'{url}: {type(exc).__name__}: {exc}')
-                LOG.warning('Listing source unavailable: %s', errors[-1])
-    raise RuntimeError(
-        'Both public Trac sources failed. The recruitment service may block '
-        'automated GitHub Actions requests (HTTP 403). This is not an email '
-        'configuration issue. No vacancies have been checked and state was not '
-        'updated.\n' + '\n'.join(errors)
-    )
+        session.headers.update({'User-Agent': 'GOSH-Vacancy-Monitor/2.0', 'Accept': 'application/xml'})
+        for page in range(1, 101):
+            params['page'] = page
+            response = session.get(FEED_URL, params=params, timeout=30)
+            LOG.info('Feed page %d: HTTP %d', page, response.status_code)
+            if response.status_code == 403:
+                raise RuntimeError('NHS Jobs XML API refused access (HTTP 403). No jobs were checked and state was not updated. Ask NHSBSA whether automated access from GitHub Actions is supported; do not treat this as an empty feed.')
+            response.raise_for_status()
+            if urlparse(response.url).hostname != 'www.jobs.nhs.uk':
+                raise ValueError('Feed redirected outside NHS Jobs')
+            pages, total, rows = parse_page(response.content)
+            if pages > 100:
+                raise ValueError('More than 100 pages returned; employer filtering may have failed')
+            if expected is None:
+                expected = (pages, total)
+            elif expected != (pages, total):
+                raise ValueError('Feed changed during pagination; retry on the next run')
+            for job in rows:
+                if job['id'] in all_jobs:
+                    raise ValueError('Repeated vacancy ID across feed pages; refusing incomplete results')
+                all_jobs[job['id']] = job
+            if page >= max(1, pages):
+                break
+    if len(all_jobs) != expected[1]:
+        raise ValueError('Retrieved vacancy count does not match totalResults')
+    gosh = {key: job for key, job in all_jobs.items()
+            if ' '.join(job['employer'].casefold().split()) == EMPLOYER.casefold()}
+    if all_jobs and not gosh:
+        raise ValueError('Feed returned vacancies but none have the GOSH employer name; verify the employer filter/code')
+    matches = {key: job for key, job in gosh.items()
+               if TITLE_PATTERN.search(job['title']) and not re.search(r'neuro[\s-]*psycholog', job['title'], re.I)}
+    LOG.info('Successfully parsed NHS Jobs XML: %d vacancies, %d GOSH vacancies, %d matching titles', len(all_jobs), len(gosh), len(matches))
+    return matches
 
 
 def load_state():
@@ -127,10 +125,10 @@ def email_message(subject, body):
     if missing:
         raise RuntimeError('Missing email settings: ' + ', '.join(missing))
     host = os.environ['SMTP_HOST']
-    port = int(os.getenv('SMTP_PORT', '465'))
+    port = int(os.getenv('SMTP_PORT') or '465')
     msg = EmailMessage()
     msg['Subject'] = subject
-    msg['From'] = os.getenv('ALERT_FROM', os.environ['SMTP_USER'])
+    msg['From'] = os.getenv('ALERT_FROM') or os.environ['SMTP_USER']
     msg['To'] = os.environ['ALERT_TO']
     msg.set_content(body)
     if os.getenv('SMTP_STARTTLS', '').lower() == 'true':
@@ -148,6 +146,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--notify-existing', action='store_true', help='Send matches on first run, instead of silently creating a baseline')
     parser.add_argument('--dry-run', action='store_true', help='Show matched jobs without sending or changing state')
+    parser.add_argument('--test-feed', action='store_true', help='Fetch and validate all feed pages without email or state changes')
     parser.add_argument('--test-email', action='store_true', help='Send one test email and exit')
     args = parser.parse_args(argv)
     if args.test_email:
@@ -156,20 +155,20 @@ def main(argv=None):
         return 0
 
     current = fetch_jobs()  # Important: do not save state on HTTP/parse failure
-    print(f'Scanned GOSH Trac employer listing: {len(current)} matching jobs')
+    print(f'Scanned NHS Jobs XML feed: {len(current)} matching jobs')
     for job in current.values():
         print(f"  {job['title']} ({job['id']}): {job['url']}")
-    if args.dry_run:
+    if args.dry_run or args.test_feed:
         return 0
     state = load_state()
-    first_run = state is None
+    first_run = state is None or state.get('source') != 'nhsjobs-xml-v2'
     seen = state['seen'] if state else {}
     new_jobs = [job for vid, job in current.items() if vid not in seen]
     if first_run and not args.notify_existing:
         LOG.info('First run: storing %d current matches without notification', len(new_jobs))
     elif new_jobs:
         body = ('New Great Ormond Street Hospital assistant psychology vacancies found.\n\n' +
-                '\n\n'.join(f"{j['title']}\n{j['url']}\nVacancy ID: {j['id']}" for j in new_jobs) +
+                '\n\n'.join(f"{j['title']}\n{j['url']}\nVacancy ID: {j['id']}\nSalary: {j.get('salary', 'Not supplied')}\nContract: {j.get('type', 'Not supplied')}\nClosing date: {j.get('closeDate', 'Not supplied')}" for j in new_jobs) +
                 '\n\nCheck the listing promptly: vacancies may close early.')
         # Only mark new jobs as seen after successful notification.
         email_message(f'GOSH vacancy alert: {len(new_jobs)} new role(s)', body)
@@ -180,7 +179,7 @@ def main(argv=None):
     for vid, job in current.items():
         if vid not in seen:
             seen[vid] = {'title': job['title'], 'url': job['url'], 'first_seen': now}
-    save_state({'seen': seen, 'last_successful_check': now})
+    save_state({'seen': seen, 'last_successful_check': now, 'source': 'nhsjobs-xml-v2'})
     return 0
 
 

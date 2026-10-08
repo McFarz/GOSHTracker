@@ -1,33 +1,101 @@
+import json
+from pathlib import Path
+import tempfile
 import unittest
-from monitor import parse_jobs, extract_title, TITLE_PATTERN
-from bs4 import BeautifulSoup
+from unittest.mock import Mock, patch
+from xml.sax.saxutils import escape
+import monitor as m
 
-HTML = '''<html><body><h2>Vacancies</h2><h3>Find jobs in...</h3>
-<a href="/job/UK/London/London/Great_Ormond_Street_Hospital_Children_NHS_Foundation_Trust/Psychology/Psychology-v8110690">Assistant Neuropsychologist Band 4 Great Ormond Street Hospital for Children NHS Foundation Trust London Salary: £...</a>
-<a href="/job/UK/London/London/Great_Ormond_Street_Hospital_Children_NHS_Foundation_Trust/Psychology/Psychology-v8900012">Senior Clinical Psychologist Band 8a Great Ormond Street Hospital for Children NHS Foundation Trust London Salary: £...</a>
-<a href="/job/UK/London/London/Great_Ormond_Street_Hospital_Children_NHS_Foundation_Trust/Psychology/Psychology-v8900013">Assistant Clinical Psychologist NHS AfC: Band 4 Great Ormond Street Hospital for Children NHS Foundation Trust London</a>
-</body></html>'''
 
-class MonitorTest(unittest.TestCase):
-    def test_matches_assistant_only(self):
-        data = parse_jobs(HTML)
-        self.assertEqual(set(data), {'8900013'})
-        self.assertEqual(data['8900013']['title'], 'Assistant Clinical Psychologist')
+def feed(rows=(), pages=1, total=None):
+    if total is None:
+        total = len(rows)
+    body = ''.join('<vacancyDetails>' + ''.join(f'<{k}>{escape(str(v))}</{k}>' for k, v in row.items()) + '</vacancyDetails>' for row in rows)
+    return f'<nhsJobs><totalPages>{pages}</totalPages><totalResults>{total}</totalResults>{body}</nhsJobs>'.encode()
 
-    def test_excludes_neuropsychologist(self):
-        self.assertFalse(TITLE_PATTERN.search('Assistant Neuropsychologist'))
-        self.assertFalse(TITLE_PATTERN.search('Assistant Clinical Neuropsychologist'))
 
-    def test_empty_listing_is_valid(self):
-        self.assertEqual(parse_jobs('<h2>Vacancies</h2><h3>Find jobs in...</h3>'), {})
+def job(identifier='one', title='Assistant Psychologist', employer=m.EMPLOYER):
+    return dict(id=identifier, title=title, employer=employer, url='https://www.jobs.nhs.uk/candidate/jobadvert/C9271-26-0001')
 
-    def test_unexpected_page_fails(self):
+
+def response(xml, status=200):
+    r = Mock(status_code=status, content=xml, url=m.FEED_URL)
+    r.raise_for_status.return_value = None
+    return r
+
+
+class MonitorTests(unittest.TestCase):
+    def test_recognized_empty_feed(self):
+        self.assertEqual(m.parse_page(feed(pages=0)), (0, 0, []))
+
+    def test_html_and_inconsistent_counts_fail(self):
+        for xml in (b'<html>Forbidden</html>', feed(pages=1, total=1), feed([job()], total=0)):
+            with self.subTest(xml=xml), self.assertRaises(ValueError):
+                m.parse_page(xml)
+
+    def test_missing_required_field_fails(self):
+        row = job()
+        del row['employer']
         with self.assertRaises(ValueError):
-            parse_jobs('<h1>Access denied</h1>')
+            m.parse_page(feed([row]))
 
-    def test_excludes_qualified_roles(self):
-        self.assertFalse(TITLE_PATTERN.search('Senior Clinical Psychologist'))
-        self.assertFalse(TITLE_PATTERN.search('Research Assistant'))
+    def test_all_pages_employer_and_title_filters(self):
+        rows = [job('1'), job('2', 'Assistant Clinical Psychologist'), job('3', 'Psychology Assistant'), job('4', 'Psychological Assistant'), job('5', 'Assistant Neuropsychologist'), job('6', 'Assistant Psychologist - Neuropsychology'), job('7', 'Senior Psychologist'), job('8', employer='Another NHS Trust')]
+        with patch.object(m.requests, 'Session') as s:
+            client = s.return_value.__enter__.return_value
+            client.get.side_effect = [response(feed(rows[:4], pages=2, total=8)), response(feed(rows[4:], pages=2, total=8))]
+            found = m.fetch_jobs()
+            self.assertEqual(set(found), {'nhsjobs:1', 'nhsjobs:2', 'nhsjobs:3', 'nhsjobs:4'})
+            self.assertEqual(client.get.call_count, 2)
+
+    def test_403_preserves_state(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d)/'state.json'
+            path.write_text('{"seen": {"previous": {}}}')
+            before = path.read_bytes()
+            with patch.object(m, 'STATE_FILE', path), patch.object(m.requests, 'Session') as s, patch.object(m, 'email_message') as send:
+                s.return_value.__enter__.return_value.get.return_value = response(b'blocked', 403)
+                with self.assertRaisesRegex(RuntimeError, '403'):
+                    m.main([])
+                send.assert_not_called()
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_partial_fetch_and_repeated_pages_fail(self):
+        for second in (response(feed([job()], pages=2, total=2)), response(feed([job('2')], pages=2, total=3))):
+            with self.subTest(), patch.object(m.requests, 'Session') as s:
+                s.return_value.__enter__.return_value.get.side_effect = [response(feed([job()], pages=2, total=2)), second]
+                with self.assertRaises(ValueError):
+                    m.fetch_jobs()
+
+    def test_test_feed_never_sends_or_saves(self):
+        with patch.object(m, 'fetch_jobs', return_value={'nhsjobs:one': job()}), patch.object(m, 'email_message') as send, patch.object(m, 'save_state') as save:
+            self.assertEqual(m.main(['--test-feed']), 0)
+            send.assert_not_called()
+            save.assert_not_called()
+
+    def test_email_failure_leaves_job_unseen(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d)/'state.json'
+            path.write_text(json.dumps({'seen': {}, 'source': 'nhsjobs-xml-v2'}))
+            before = path.read_bytes()
+            with patch.object(m, 'STATE_FILE', path), patch.object(m, 'fetch_jobs', return_value={'nhsjobs:one': job()}), patch.object(m, 'email_message', side_effect=RuntimeError('SMTP failure')):
+                with self.assertRaisesRegex(RuntimeError, 'SMTP'):
+                    m.main([])
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_source_migration_baselines_once(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d)/'state.json'
+            path.write_text(json.dumps({'seen': {'123': {'title': 'Old Trac entry'}}}))
+            with patch.object(m, 'STATE_FILE', path), patch.object(m, 'fetch_jobs', return_value={'nhsjobs:one': job()}), patch.object(m, 'email_message') as send:
+                m.main([])
+                state = json.loads(path.read_text())
+                self.assertEqual(state['source'], 'nhsjobs-xml-v2')
+                self.assertIn('123', state['seen'])
+                self.assertIn('nhsjobs:one', state['seen'])
+                m.main([])
+                send.assert_not_called()
+
 
 if __name__ == '__main__':
     unittest.main()

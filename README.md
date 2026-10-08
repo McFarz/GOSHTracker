@@ -1,66 +1,134 @@
-# GOSH Assistant Psychology Job Monitor
+# GOSH job monitor v2: official NHS Jobs XML feed
 
-Checks the **Great Ormond Street Hospital for Children NHS Foundation Trust** employer listing on Trac's `nhsjobs.com` website every ~30 minutes and emails when a *new* assistant psychology job appears.
+This is an experimental feed integration for learning. It replaces the blocked
+Trac HTML scraper. It has not yet passed a live feed test: NHS Jobs returned
+HTTP 403 from the development environment. GitHub Actions access is still
+unknown. Offline tests verify behavior, not live access or feed coverage.
 
-Source: https://www.nhsjobs.com/jobs_emp?emp=54
+## Update your existing GOSHTracker repository
 
-It matches titles such as **Assistant Psychologist**, **Assistant Clinical Psychologist**, **Psychology Assistant**, and **Psychological Assistant**. It deliberately excludes **Assistant Neuropsychologist**, other neuropsychology titles, general psychologist, senior psychologist, and research assistant jobs. Edit `TITLE_PATTERN` in `monitor.py` to change the match criteria.
+Keep your email secrets and seen_jobs.json. Replace/add these files at the
+repository root (do not upload the enclosing gosh-job-monitor-v2 folder):
 
-## Setup (GitHub Actions, recommended)
+- monitor.py
+- requirements.txt
+- tests/test_monitor.py
+- .github/workflows/monitor.yml
 
-1. Create a **private GitHub repository**, e.g. `gosh-job-monitor`.
-2. Upload the contents of this folder to its repository root, including the `.github/workflows/monitor.yml` file (GitHub may hide dot-prefixed folders in some upload interfaces; Git from a terminal is reliable).
-3. Go to the repository's **Settings → Secrets and variables → Actions → New repository secret**. Add:
+The workflow uses the existing name. If GitHub's upload interface omits .github,
+open the existing workflow file and paste in the supplied YAML. All four files
+must be present because the workflow now runs the tests.
 
-   | Secret | Example / purpose |
-   |---|---|
-   | `SMTP_HOST` | `smtp.gmail.com` for Gmail |
-   | `SMTP_PORT` | `465` for Gmail SSL |
-   | `SMTP_USER` | the email account sending alerts |
-   | `SMTP_PASSWORD` | SMTP app password, **not** the regular mailbox password |
-   | `ALERT_TO` | recipient email address |
+1. Commit the changes to the default branch, normally main.
+2. Actions > GOSH assistant psychologist vacancies > Run workflow.
+3. Select main and choose mode `test-feed`.
+4. Start a NEW run, rather than re-running a previous commit.
+5. Read the `Check for vacancies` log.
 
-   Optional: `ALERT_FROM` (custom from address; sender policy may prevent changing it), `SMTP_STARTTLS` (`true` if using port `587`, otherwise omit). With Gmail, use 2-Step Verification and generate an **app password** if that option is available. Alternatively use another provider with SMTP credentials. **Never commit secrets to GitHub.**
-4. In the repository's **Actions** tab, enable workflows if prompted. In **Settings → Actions → General**, make sure workflow permissions allow **Read and write permissions**. The workflow commits `seen_jobs.json` to keep a durable record of vacancies already detected.
-5. In **Actions → GOSH assistant psychologist vacancies → Run workflow**, run it manually for the first time. This **creates the baseline without sending alerts** for jobs already present. Watch the workflow log; success means the site was parsed and the state was saved.
-6. Future runs check every 30 minutes (scheduling can be delayed). **GitHub may automatically disable scheduled workflows in inactive public repos**; a private repo is recommended for privacy, but still occasionally verify checks are running. Free-tier minutes and service limits may apply.
+A successful response logs `Successfully parsed NHS Jobs XML`, showing the
+number retrieved, the number with the exact GOSH employer name, and the number
+of matching titles. A recognized zero-result XML feed is valid, but does not
+prove the employer filter is correct or that all GOSH vacancies are syndicated.
+Confirm results against NHS Jobs before relying on it.
 
-**For testing your email immediately**, run `python monitor.py --test-email` locally with the variables configured. Or temporarily run `python monitor.py --notify-existing` locally on a *fresh* database, if a matching vacancy is available. Note: a first normal run is intentionally silent.
+If the API returns 403 in GitHub Actions too, stop here. This version does not
+bypass access controls or substitute another hostname. Ask NHS Jobs support at
+nhsbsa.nhsjobs@nhsbsa.nhs.uk whether the Self-Serve XML API supports personal
+monitoring from GitHub-hosted runners, and whether an approved access mechanism
+is required. You must send that enquiry yourself.
 
-## Running on Windows locally
+After a successful feed test, select `test-email` to send a test message to your
+configured ALERT_TO recipient. Then select `monitor` to create the new baseline.
+Scheduled runs also use monitor mode. The schedule is active as soon as this
+workflow is on the default branch, so it may create the baseline before your
+manual run. On the first successful v2 monitoring run, current matching
+vacancies are recorded without email. Future unseen IDs trigger an email.
+
+Keep Settings > Actions > General > Workflow permissions set to permit writing
+state. Branch protection may prevent the state commit; check the final workflow
+step too. If it fails, future runs may repeat alerts.
+
+## Documented API
+
+Source: NHSBSA Self-Serve Job Adverts API V1.07, dated 1 May 2026:
+https://www.nhsbsa.nhs.uk/about-nhs-jobs/nhs-jobs-integration-and-benefits
+
+Specification linked there:
+https://www.nhsbsa.nhs.uk/sites/default/files/2026-05/NHS%20Jobs%20Self-Serve%20Job%20Adverts%20API%20V1.07_0.docx
+
+Endpoint: https://www.jobs.nhs.uk/api/v1/search_xml
+
+Default query parameters:
+
+- employer=Great Ormond Street Hospital for Children NHS Foundation Trust
+- limit=100
+- page=1, followed by subsequent pages as needed
+- sort=publicationDateDesc
+
+The code also checks each vacancy's employer name locally. It uses title-only
+matching for Assistant Psychologist, Assistant Clinical Psychologist,
+Psychology Assistant (including Clinical Psychology Assistant), and
+Psychological Assistant. Titles containing neuropsychology are excluded.
+Research assistant and qualified psychologist titles do not match.
+
+Optional: NHS_EMPLOYER_CODE can be set as a repository Actions variable if you
+obtain GOSH's confirmed NHS Jobs employer code from support or GOSH recruitment.
+When supplied, it replaces the employer-name query and adds externalOnly=true.
+No employer code is guessed from vacancy reference numbers or Trac's emp=54.
+This version does not request internal-only vacancies.
+
+The XML includes title, ID, employer, URL, salary, contract type, and closing
+date. The last three are included in emails when supplied. Band and working
+pattern are not dedicated fields in this XML response, so they are not inferred.
+
+## How the Python program works
+
+1. Request the XML feed with requests.
+2. Parse it with defusedxml and validate the wrapper, counts, required fields,
+   and NHS Jobs vacancy links.
+3. Fetch all pages. Reject repeated IDs, inconsistent totals or incomplete results.
+4. Filter by exact employer name, then title.
+5. Compare the NHS Jobs IDs with seen_jobs.json.
+6. Send one email listing the new matches.
+7. Save state atomically only after successful processing/email submission.
+
+NHS Jobs IDs are prefixed `nhsjobs:` to avoid collisions with Trac's numeric IDs.
+Existing Trac history is retained. Source migration baselines once to avoid
+re-alerting on roles already present at the transition.
+
+State is not updated on HTTP errors, unexpected XML, incomplete pagination or
+email errors. SMTP submission does not guarantee inbox delivery. If the process
+crashes after SMTP accepts a message but before state is saved, an alert can be
+repeated on the next run. Re-publishing the same vacancy ID does not trigger a
+new alert. New IDs may represent re-advertised roles.
+
+## Local commands
+
+From the extracted project directory, with Python 3.12:
 
 ```powershell
-py -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-$env:SMTP_HOST = "smtp.gmail.com"
-$env:SMTP_PORT = "465"
-$env:SMTP_USER = "your-sender@gmail.com"
-$env:SMTP_PASSWORD = "your-app-password"
-$env:ALERT_TO = "your-recipient@example.com"
-python monitor.py --test-email
-python monitor.py --dry-run
-python monitor.py
+py -m pip install -r requirements.txt
+py -m unittest discover -s tests -v
+py monitor.py --test-feed
 ```
 
-Run regularly with Windows Task Scheduler if not using GitHub Actions. Keep the same working directory so `seen_jobs.json` is preserved.
+`--test-feed` and `--dry-run` never send email or write state. `--test-email`
+uses your existing SMTP environment settings. Normal `py monitor.py` creates
+state and sends alerts for new matches. `--notify-existing` sends currently
+matching jobs when creating the initial v2 baseline; it does not resend seen IDs.
 
-## Details and limitations
+## Limits and learning next steps
 
-- **Public vacancies only.** Does **not** search GOSH's internal staff-only portal or private vacancies; it does not use employee access. If some roles are genuinely posted *only* internally, this tool cannot detect them.
-- Only the **Trac `nhsjobs.com` employer vacancy list** is monitored in this version; it does not independently crawl NHS Jobs, the charity site, or other sources. This keeps false matches low and requests modest.
-- Vacancy IDs are deduplicated across runs. **If email sending fails, the job is not marked seen**, so the next run will retry.
-- The first normal run seeds existing jobs rather than alerting. Run with `--notify-existing` if you want alerts for current matching jobs on your first run.
-- Site redesign, anti-bot controls, or changes in listing structure can disrupt checks. Errors fail the GitHub Actions run rather than silently marking jobs absent. Check Actions run history and enable GitHub workflow-failure notifications in your account settings.
-- This is a **targeted monitor**, not a guaranteed immediate notification service. There can be site publication delays, parsing failures, GitHub schedule delays, or brief postings between checks.
-- Respect website terms and robots restrictions; the script makes one request per scheduled check with a 30-second timeout.
-- To change the interval, edit `cron` in `.github/workflows/monitor.yml`. Current schedule: minutes 7 and 37 of each hour, in UTC.
+- Both HTML hosts returned 403 in the user's GitHub Actions logs. That establishes
+  refusal for those requests, not the site's exact blocking policy.
+- The documented API may also be blocked; only the new GitHub run will tell us.
+- There is no failure email or daily heartbeat in this version. Errors appear in
+  Actions logs. Configure GitHub's workflow-failure notifications separately.
+- Cron requests runs at minutes 7 and 37 of each hour; execution can be delayed.
+- Fetching every GOSH vacancy before title filtering avoids relying on the API's
+  keyword search, which also searches descriptions.
+- A public feed cannot prove coverage of staff-only or un-syndicated vacancies.
 
-## Tests
-
-```bash
-pip install -r requirements.txt
-python -m unittest discover -s tests -v
-```
-
-The parser has offline fixture tests. **A live website check was not possible in the build environment**, so please run `python monitor.py --dry-run` locally or the manual GitHub workflow and inspect the output to confirm current site compatibility.
+The useful lesson is to distinguish transport success (HTTP 200), valid data
+(XML and pagination), correct filtering, and successful notification. A green
+workflow alone does not establish all four.
